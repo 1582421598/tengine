@@ -488,9 +488,8 @@ ngx_http_v2_header_filter(ngx_http_request_t *r)
 
         }
 
-        *pos++ = ngx_http_v2_inc_indexed(NGX_HTTP_V2_SERVER_INDEX);
-
         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+			*pos++ = ngx_http_v2_inc_indexed(NGX_HTTP_V2_SERVER_INDEX);
             if (nginx_ver[0] == '\0') {
 #if (T_NGX_SERVER_INFO)
                 p = ngx_http_v2_write_value(nginx_ver, (u_char *) TENGINE_VER,
@@ -505,6 +504,7 @@ ngx_http_v2_header_filter(ngx_http_request_t *r)
             pos = ngx_cpymem(pos, nginx_ver, nginx_ver_len);
 
         } else if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_BUILD) {
+			*pos++ = ngx_http_v2_inc_indexed(NGX_HTTP_V2_SERVER_INDEX);
             if (nginx_ver_build[0] == '\0') {
 #if (T_NGX_SERVER_INFO)
                 p = ngx_http_v2_write_value(nginx_ver_build,
