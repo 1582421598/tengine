@@ -301,8 +301,6 @@ ngx_http_header_filter(ngx_http_request_t *r)
         } else if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_BUILD) {
             len += sizeof(ngx_http_server_build_string) - 1;
 
-        } else {
-            len += sizeof(ngx_http_server_string) - 1;
         }
 #endif
     }
@@ -488,17 +486,13 @@ ngx_http_header_filter(ngx_http_request_t *r)
         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
             p = ngx_http_server_full_string;
             len = sizeof(ngx_http_server_full_string) - 1;
+			b->last = ngx_cpymem(b->last, p, len);
 
         } else if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_BUILD) {
             p = ngx_http_server_build_string;
             len = sizeof(ngx_http_server_build_string) - 1;
-
-        } else {
-            p = ngx_http_server_string;
-            len = sizeof(ngx_http_server_string) - 1;
+            b->last = ngx_cpymem(b->last, p, len);
         }
-
-        b->last = ngx_cpymem(b->last, p, len);
 #endif
     }
 
