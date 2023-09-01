@@ -55,13 +55,6 @@ typedef struct {
     ngx_str_t                  ssl_trusted_certificate;
     ngx_str_t                  ssl_crl;
     ngx_array_t               *ssl_conf_commands;
-
-#if (T_NGX_SSL_NTLS)
-    ngx_str_t                  enc_certificate;
-    ngx_str_t                  enc_certificate_key;
-    ngx_str_t                  sign_certificate;
-    ngx_str_t                  sign_certificate_key;
-#endif
 #endif
 } ngx_http_uwsgi_loc_conf_t;
 
@@ -103,6 +96,8 @@ static char *ngx_http_uwsgi_ssl_password_file(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_uwsgi_ssl_conf_command_check(ngx_conf_t *cf, void *post,
     void *data);
+static ngx_int_t ngx_http_uwsgi_merge_ssl(ngx_conf_t *cf,
+    ngx_http_uwsgi_loc_conf_t *conf, ngx_http_uwsgi_loc_conf_t *prev);
 static ngx_int_t ngx_http_uwsgi_set_ssl(ngx_conf_t *cf,
     ngx_http_uwsgi_loc_conf_t *uwcf);
 #endif
@@ -599,28 +594,28 @@ static ngx_command_t ngx_http_uwsgi_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_uwsgi_loc_conf_t, enc_certificate),
+      offsetof(ngx_http_uwsgi_loc_conf_t, upstream.enc_certificate),
       NULL },
 
     { ngx_string("uwsgi_ssl_enc_certificate_key"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_uwsgi_loc_conf_t, enc_certificate_key),
+      offsetof(ngx_http_uwsgi_loc_conf_t, upstream.enc_certificate_key),
       NULL },
 
     { ngx_string("uwsgi_ssl_sign_certificate"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_uwsgi_loc_conf_t, sign_certificate),
+      offsetof(ngx_http_uwsgi_loc_conf_t, upstream.sign_certificate),
       NULL },
 
     { ngx_string("uwsgi_ssl_sign_certificate_key"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_uwsgi_loc_conf_t, sign_certificate_key),
+      offsetof(ngx_http_uwsgi_loc_conf_t, upstream.sign_certificate_key),
       NULL },
 #endif
 #endif
@@ -720,7 +715,7 @@ ngx_http_uwsgi_handler(ngx_http_request_t *r)
     if (uwcf->uwsgi_lengths == NULL) {
 
 #if (NGX_HTTP_SSL)
-        u->ssl = (uwcf->upstream.ssl != NULL);
+        u->ssl = uwcf->ssl;
 
         if (u->ssl) {
             ngx_str_set(&u->schema, "suwsgi://");
@@ -897,13 +892,13 @@ ngx_http_uwsgi_create_key(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_uwsgi_create_request(ngx_http_request_t *r)
 {
-    u_char                        ch, *lowcase_key;
+    u_char                        ch, sep, *lowcase_key;
     size_t                        key_len, val_len, len, allocated;
     ngx_uint_t                    i, n, hash, skip_empty, header_params;
     ngx_buf_t                    *b;
     ngx_chain_t                  *cl, *body;
     ngx_list_part_t              *part;
-    ngx_table_elt_t              *header, **ignored;
+    ngx_table_elt_t              *header, *hn, **ignored;
     ngx_http_uwsgi_params_t      *params;
     ngx_http_script_code_pt       code;
     ngx_http_script_engine_t      e, le;
@@ -957,7 +952,11 @@ ngx_http_uwsgi_create_request(ngx_http_request_t *r)
         allocated = 0;
         lowcase_key = NULL;
 
-        if (params->number) {
+        if (ngx_http_link_multi_headers(r) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (params->number || r->headers_in.multi) {
             n = 0;
             part = &r->headers_in.headers.part;
 
@@ -985,6 +984,12 @@ ngx_http_uwsgi_create_request(ngx_http_request_t *r)
                 part = part->next;
                 header = part->elts;
                 i = 0;
+            }
+
+            for (n = 0; n < header_params; n++) {
+                if (&header[i] == ignored[n]) {
+                    goto next_length;
+                }
             }
 
             if (params->number) {
@@ -1020,6 +1025,15 @@ ngx_http_uwsgi_create_request(ngx_http_request_t *r)
 
             len += 2 + sizeof("HTTP_") - 1 + header[i].key.len
                  + 2 + header[i].value.len;
+
+            for (hn = header[i].next; hn; hn = hn->next) {
+                len += hn->value.len + 2;
+                ignored[header_params++] = hn;
+            }
+
+        next_length:
+
+            continue;
         }
     }
 
@@ -1138,7 +1152,7 @@ ngx_http_uwsgi_create_request(ngx_http_request_t *r)
 
             for (n = 0; n < header_params; n++) {
                 if (&header[i] == ignored[n]) {
-                    goto next;
+                    goto next_value;
                 }
             }
 
@@ -1161,15 +1175,41 @@ ngx_http_uwsgi_create_request(ngx_http_request_t *r)
             }
 
             val_len = header[i].value.len;
+
+            for (hn = header[i].next; hn; hn = hn->next) {
+                val_len += hn->value.len + 2;
+            }
+
             *b->last++ = (u_char) (val_len & 0xff);
             *b->last++ = (u_char) ((val_len >> 8) & 0xff);
-            b->last = ngx_copy(b->last, header[i].value.data, val_len);
+            b->last = ngx_copy(b->last, header[i].value.data,
+                               header[i].value.len);
+
+            if (header[i].next) {
+
+                if (header[i].key.len == sizeof("Cookie") - 1
+                    && ngx_strncasecmp(header[i].key.data, (u_char *) "Cookie",
+                                       sizeof("Cookie") - 1)
+                       == 0)
+                {
+                    sep = ';';
+
+                } else {
+                    sep = ',';
+                }
+
+                for (hn = header[i].next; hn; hn = hn->next) {
+                    *b->last++ = sep;
+                    *b->last++ = ' ';
+                    b->last = ngx_copy(b->last, hn->value.data, hn->value.len);
+                }
+            }
 
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "uwsgi param: \"%*s: %*s\"",
                            key_len, b->last - (key_len + 2 + val_len),
                            val_len, b->last - val_len);
-        next:
+        next_value:
 
             continue;
         }
@@ -1347,8 +1387,12 @@ ngx_http_uwsgi_process_header(ngx_http_request_t *r)
             hh = ngx_hash_find(&umcf->headers_in_hash, h->hash,
                                h->lowcase_key, h->key.len);
 
-            if (hh && hh->handler(r, h, hh->offset) != NGX_OK) {
-                return NGX_ERROR;
+            if (hh) {
+                rc = hh->handler(r, h, hh->offset);
+
+                if (rc != NGX_OK) {
+                    return rc;
+                }
             }
 
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1873,12 +1917,17 @@ ngx_http_uwsgi_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
 #if (NGX_HTTP_SSL)
 
+    if (ngx_http_uwsgi_merge_ssl(cf, conf, prev) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
     ngx_conf_merge_value(conf->upstream.ssl_session_reuse,
                               prev->upstream.ssl_session_reuse, 1);
 
     ngx_conf_merge_bitmask_value(conf->ssl_protocols, prev->ssl_protocols,
-                                 (NGX_CONF_BITMASK_SET|NGX_SSL_TLSv1
-                                  |NGX_SSL_TLSv1_1|NGX_SSL_TLSv1_2));
+                                 (NGX_CONF_BITMASK_SET
+                                  |NGX_SSL_TLSv1|NGX_SSL_TLSv1_1
+                                  |NGX_SSL_TLSv1_2|NGX_SSL_TLSv1_3));
 
     ngx_conf_merge_str_value(conf->ssl_ciphers, prev->ssl_ciphers,
                              "DEFAULT");
@@ -1913,14 +1962,14 @@ ngx_http_uwsgi_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->upstream.enable_ntls == NULL) {
         conf->upstream.enable_ntls = prev->upstream.enable_ntls;
     }
-    ngx_conf_merge_str_value(conf->enc_certificate,
-                             prev->enc_certificate, "");
-    ngx_conf_merge_str_value(conf->enc_certificate_key,
-                             prev->enc_certificate_key, "");
-    ngx_conf_merge_str_value(conf->sign_certificate,
-                             prev->sign_certificate, "");
-    ngx_conf_merge_str_value(conf->sign_certificate_key,
-                             prev->sign_certificate_key, "");
+    ngx_conf_merge_str_value(conf->upstream.enc_certificate,
+                             prev->upstream.enc_certificate, "");
+    ngx_conf_merge_str_value(conf->upstream.enc_certificate_key,
+                             prev->upstream.enc_certificate_key, "");
+    ngx_conf_merge_str_value(conf->upstream.sign_certificate,
+                             prev->upstream.sign_certificate, "");
+    ngx_conf_merge_str_value(conf->upstream.sign_certificate_key,
+                             prev->upstream.sign_certificate_key, "");
     conf->upstream.ssl_ciphers = conf->ssl_ciphers;
 #endif
 #endif
@@ -1949,7 +1998,7 @@ ngx_http_uwsgi_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->uwsgi_values = prev->uwsgi_values;
 
 #if (NGX_HTTP_SSL)
-        conf->upstream.ssl = prev->upstream.ssl;
+        conf->ssl = prev->ssl;
 #endif
     }
 
@@ -2477,16 +2526,62 @@ ngx_http_uwsgi_ssl_conf_command_check(ngx_conf_t *cf, void *post, void *data)
 
 
 static ngx_int_t
+ngx_http_uwsgi_merge_ssl(ngx_conf_t *cf, ngx_http_uwsgi_loc_conf_t *conf,
+    ngx_http_uwsgi_loc_conf_t *prev)
+{
+    ngx_uint_t  preserve;
+
+    if (conf->ssl_protocols == 0
+        && conf->ssl_ciphers.data == NULL
+        && conf->upstream.ssl_certificate == NGX_CONF_UNSET_PTR
+        && conf->upstream.ssl_certificate_key == NGX_CONF_UNSET_PTR
+        && conf->upstream.ssl_passwords == NGX_CONF_UNSET_PTR
+        && conf->upstream.ssl_verify == NGX_CONF_UNSET
+        && conf->ssl_verify_depth == NGX_CONF_UNSET_UINT
+        && conf->ssl_trusted_certificate.data == NULL
+        && conf->ssl_crl.data == NULL
+        && conf->upstream.ssl_session_reuse == NGX_CONF_UNSET
+        && conf->ssl_conf_commands == NGX_CONF_UNSET_PTR)
+    {
+        if (prev->upstream.ssl) {
+            conf->upstream.ssl = prev->upstream.ssl;
+            return NGX_OK;
+        }
+
+        preserve = 1;
+
+    } else {
+        preserve = 0;
+    }
+
+    conf->upstream.ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+    if (conf->upstream.ssl == NULL) {
+        return NGX_ERROR;
+    }
+
+    conf->upstream.ssl->log = cf->log;
+
+    /*
+     * special handling to preserve conf->upstream.ssl
+     * in the "http" section to inherit it to all servers
+     */
+
+    if (preserve) {
+        prev->upstream.ssl = conf->upstream.ssl;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_http_uwsgi_set_ssl(ngx_conf_t *cf, ngx_http_uwsgi_loc_conf_t *uwcf)
 {
     ngx_pool_cleanup_t  *cln;
 
-    uwcf->upstream.ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
-    if (uwcf->upstream.ssl == NULL) {
-        return NGX_ERROR;
+    if (uwcf->upstream.ssl->ctx) {
+        return NGX_OK;
     }
-
-    uwcf->upstream.ssl->log = cf->log;
 
     if (ngx_ssl_create(uwcf->upstream.ssl, uwcf->ssl_protocols, NULL)
         != NGX_OK)
@@ -2509,8 +2604,9 @@ ngx_http_uwsgi_set_ssl(ngx_conf_t *cf, ngx_http_uwsgi_loc_conf_t *uwcf)
         return NGX_ERROR;
     }
 
-    if (uwcf->upstream.ssl_certificate) {
-
+    if (uwcf->upstream.ssl_certificate
+        && uwcf->upstream.ssl_certificate->value.len)
+    {
         if (uwcf->upstream.ssl_certificate_key == NULL) {
             ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                           "no \"uwsgi_ssl_certificate_key\" is defined "
@@ -2550,18 +2646,19 @@ ngx_http_uwsgi_set_ssl(ngx_conf_t *cf, ngx_http_uwsgi_loc_conf_t *uwcf)
 
 #if (T_NGX_SSL_NTLS)
     uwcf->upstream.tls_method = SSL_CTX_get_ssl_method(uwcf->upstream.ssl->ctx);
-    if (uwcf->enc_certificate.len) {
+    if (uwcf->upstream.enc_certificate.len) {
 
-        if (uwcf->enc_certificate_key.len == 0) {
+        if (uwcf->upstream.enc_certificate_key.len == 0) {
             ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                           "no \"uwsgi_ssl_enc_certificate_key\" is defined "
-                          "for certificate \"%V\"", &uwcf->enc_certificate);
+                          "for certificate \"%V\"",
+                          &uwcf->upstream.enc_certificate);
             return NGX_ERROR;
         }
 
         if (ngx_ssl_certificate(cf, uwcf->upstream.ssl,
-                                &uwcf->upstream.ssl_certificate->value,
-                                &uwcf->upstream.ssl_certificate_key->value,
+                                &uwcf->upstream.enc_certificate,
+                                &uwcf->upstream.enc_certificate_key,
                                 uwcf->upstream.ssl_passwords,
                                 SSL_ENC_CERT)
             != NGX_OK)
@@ -2570,18 +2667,19 @@ ngx_http_uwsgi_set_ssl(ngx_conf_t *cf, ngx_http_uwsgi_loc_conf_t *uwcf)
         }
     }
 
-    if (uwcf->sign_certificate.len) {
+    if (uwcf->upstream.sign_certificate.len) {
 
-        if (uwcf->sign_certificate_key.len == 0) {
+        if (uwcf->upstream.sign_certificate_key.len == 0) {
             ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                           "no \"uwsgi_ssl_sign_certificate_key\" is defined "
-                          "for certificate \"%V\"", &uwcf->sign_certificate);
+                          "for certificate \"%V\"",
+                          &uwcf->upstream.sign_certificate);
             return NGX_ERROR;
         }
 
         if (ngx_ssl_certificate(cf, uwcf->upstream.ssl,
-                                &uwcf->upstream.ssl_certificate->value,
-                                &uwcf->upstream.ssl_certificate_key->value,
+                                &uwcf->upstream.sign_certificate,
+                                &uwcf->upstream.sign_certificate_key,
                                 uwcf->upstream.ssl_passwords,
                                 SSL_SIGN_CERT)
             != NGX_OK)
