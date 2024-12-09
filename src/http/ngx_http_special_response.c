@@ -89,7 +89,7 @@ static u_char ngx_http_server_info_tail[] =
 
 
 static u_char ngx_http_error_banner[] =
-"<hr/>Powered by " TENGINE;
+"<hr/>Powered by Null";
 
 
 static u_char ngx_http_error_full_banner[] =
@@ -103,9 +103,9 @@ static u_char ngx_http_error_powered_by[] =
 
 static u_char ngx_http_error_tail[] =
 #if (T_NGX_SERVER_INFO)
-"<hr><center>tengine</center>" CRLF
+"<hr><center>error</center>" CRLF
 #else
-"<hr><center>nginx</center>" CRLF
+"<hr><center>error</center>" CRLF
 #endif
 
 "</body>" CRLF
